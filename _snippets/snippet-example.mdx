@@ -1,3 +1,1035 @@
-## My Snippet
+// Code your design here
+// Code your design here
 
-<Info>This is an example of a reusable snippet</Info>
+interface can_intf();
+  logic clk;
+  logic rst_n;
+wire can_l;
+  wire can_h;
+  logic can_tx1;
+  logic can_rx1;
+  logic baud_clk;
+  logic send_data;
+  logic [63:0] transmit_data;
+ // logic can_tx2;
+  //logic can_rx2;
+  
+
+  clocking cb @(posedge baud_clk);
+    inout can_l;
+    inout can_h;
+    input can_rx1;
+    input send_data;
+    input transmit_data;
+  //  output can_rx2;
+    output can_tx1;
+    //input can_tx2;
+    
+  endclocking
+
+
+
+
+
+endinterface
+module can_bfm_top(input clk,rst_n,can_rx1,output can_tx1,inout can_h,can_l); //(can_intf intf);
+  //reg send_data;
+  
+  
+  //reg can_rx1;
+  reg [63:0] transmit_data;
+  wire can_en;
+  assign can_en = cntr.tx_can.txing;
+ 
+  assign can_h=can_en?can_tx1:1'bz;
+  assign can_l=can_en?~can_tx1:1'bz;
+  
+  can_controller cntr(.CAN_RX(can_rx1),
+                      .CAN_TX(can_tx1),
+                      .clk(clk),
+                      .RESET(rst_n),
+                      .send_data(intf.send_data),
+                      .transmit_data(intf.transmit_data));
+endmodule
+
+
+module can_controller(
+	output CAN_TX,
+	input CAN_RX,
+	input RESET,
+    input clk,
+	//input baud_clk,
+	input send_data,
+  input[63:0] transmit_data
+	);
+	
+//	wire[63:0] tx_data;
+	wire txing,rxing;
+  wire [63:0] rx_data;
+	wire baud_clk;
+	//assign tx_data = {8{transmit_data}};
+	
+	//Device address, arbitrarily chosen
+	
+  parameter address = 11'h25;
+	//Clock Generator (100MHz in, 400MHz out)
+	//Clock_gen clock_block(CLOCK_SIGNAL_IN,clk);
+	
+	//Baud Clk Generator(currently set for baud of 500kHz)
+	BaudGen baud_calc(clk,RESET,baud_clk);
+
+	
+	//Tx Block
+	//can_tx tx_block(CAN_TX,CAN_RX,address,clk,baud_clk,RESET,tx_data,send_data);
+  tx_container tx_can(CAN_TX,txing,CAN_RX,rxing,address,clk,baud_clk,RESET,transmit_data,send_data);//transmit_data
+//////////////////////////////////////  
+	rx_container rx_can(rx_data,rxing,txing,CAN_RX,clk,baud_clk,RESET);
+	
+	//Rx goes here
+
+	
+endmodule
+module tx_container(
+	output reg tx,
+	output txing,
+	input rx,
+	input rxing,
+	input[10:0] address,
+	input clk,
+	input baud_clk,
+	input rst,
+	input [63:0] data,
+	input send_data
+    );
+
+   wire clear_to_tx;
+	parameter  init = 2'h0,  ones = 2'h1, zeros = 2'h2;
+	assign clear_to_tx =1;
+	reg bit_stuffing = 0;
+	reg[1:0] c_state=0, n_state=0, p_state = 0;
+	reg[31:0] bit_stuffing_count = 0;
+	wire can_bitstuff;
+	reg tx_buf;
+  
+	can_tx tx_block(tx_buf,can_bitstuff,txing,rx,address,clk,baud_clk,rst,data,send_data,tx,clear_to_tx);
+
+	always @ (posedge clk or posedge rst) begin
+		if(rst) begin
+			bit_stuffing_count<= 0;
+			bit_stuffing <= 0;
+		end
+		else begin
+			if(n_state != c_state) begin
+				bit_stuffing_count<= 0;
+				bit_stuffing <= 0;
+			end
+			else if(!can_bitstuff) begin
+				bit_stuffing_count <= 0;
+				bit_stuffing <= 0;
+			end 
+			else if(bit_stuffing_count >= 5000)begin
+				bit_stuffing_count <= 0;
+				bit_stuffing <= 0;
+			end
+			else if(bit_stuffing_count >= 4000)begin
+				bit_stuffing_count <= bit_stuffing_count + 1;
+				bit_stuffing <= 1;
+			end
+			else begin
+				bit_stuffing_count <= bit_stuffing_count +1;
+				bit_stuffing <= 0;
+			end
+		end
+	end
+
+	always @ (posedge clk) begin
+		c_state <= n_state;
+	end
+
+	always @ (tx_buf) begin
+		if(tx_buf == 1) begin
+			n_state<= ones;
+		end
+		else begin
+			n_state <= zeros;
+		end
+	end
+
+	always @ (bit_stuffing or tx_buf) begin
+		if(bit_stuffing) begin
+			tx <= ~tx_buf;
+		end
+		else begin
+			tx <= tx_buf;
+		end
+	end
+endmodule
+  module can_tx(
+	output reg tx,
+	output reg can_bitstuff,
+	output reg txing,
+	input rx,
+	input[10:0] address,
+	input clk,
+	input baud_clk,
+	input rst,
+	input [63:0] data,
+	input send_data,
+	input bitstuffed_output,
+	input clear_to_tx
+	);
+	
+	wire rx_buf;
+	assign rx_buf = tx;
+	parameter all_ones = 15'b111111111111111;
+	parameter idle = 8'h0,  start_of_frame = 8'h1, addressing =8'h2 ,rtr = 8'h3 ,ide = 8'h4, reserve_bit = 8'h5, num_of_bytes = 8'h6,
+			data_out = 8'h7, crc_out = 8'h8, crc_delimiter = 8'h9 , ack = 8'hA, ack_delimiter =  8'hB, end_of_frame = 8'hC, waiting = 8'hD;
+
+	parameter bytes = 5'd8;
+	reg[10:0] address_count = 0, crc_count = 0, eof_count = 0 , data_bit_count = 0, data_byte_count = 0;
+	reg[7:0] c_state=0, n_state=0;
+	initial txing = 0;
+	
+	reg[14:0] crc_output, crc_holder;
+	wire one_shotted_send;
+	wire[14:0] crc_buff;
+	CRC cyclic_red_check(data, one_shotted_send, crc_buff,rst,clk);
+	
+	OneShot os(send_data, clk, rst, one_shotted_send);
+ 
+	always @(crc_buff or crc_holder) begin
+		if(crc_buff != all_ones) 
+			crc_output <= crc_buff;
+		else
+			crc_output <= crc_holder;
+	end
+	
+	always @ (posedge clk or posedge rst) begin
+		if(rst == 1) begin
+			crc_holder <= 15'd0;
+		end
+		else begin
+			crc_holder <= crc_output;
+		end
+	end
+	
+	//Update Logic
+	always @ (posedge baud_clk or posedge rst) begin
+		if(rst == 1) begin
+			c_state <= 32'd0;
+		end
+		else begin
+			c_state <= n_state;
+		end
+	end
+
+	//Counting Logic
+	always @ (posedge baud_clk) begin
+		case(c_state) 
+			idle: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			waiting: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			start_of_frame:begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			addressing: begin
+				address_count <= address_count + 1'b1;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			rtr: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			ide: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			reserve_bit: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			num_of_bytes: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= data_byte_count +1'b1;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			data_out: begin
+				address_count <= 11'd0;
+				data_bit_count<= data_bit_count +1'b1;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			crc_out: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= crc_count + 1'b1; 
+				eof_count <= 11'd0;
+			end
+			crc_delimiter: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			ack: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			ack_delimiter:begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			end_of_frame: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= eof_count +1'b1;
+			end
+			default: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+		endcase
+	end
+
+	//Next State Logic
+	always @ (c_state or rx_buf or data or send_data or address_count or bitstuffed_output or data_byte_count
+		or data_bit_count or crc_count or eof_count or clear_to_tx or crc_output) begin
+		case(c_state)
+			idle: begin
+				if(send_data && clear_to_tx) begin
+					n_state <= start_of_frame;
+				end
+				else begin
+					n_state <= idle;
+				end
+			end
+			start_of_frame: begin
+				if(!rx_buf) begin
+					n_state <= addressing;
+				end
+				else begin
+					n_state <= waiting;
+				end
+			end
+			waiting: begin
+				if(send_data && clear_to_tx) begin
+					n_state <= start_of_frame;
+				end
+				else begin
+					n_state <= waiting;
+				end
+			end
+			addressing: begin
+				if(rx_buf != bitstuffed_output) begin
+					n_state <= waiting; //Lost Arbitration
+				end
+				else if(address_count == 11'd10) begin
+					n_state <= rtr;
+				end
+				else begin
+					n_state <= addressing;
+				end
+			end
+			rtr: begin
+				n_state <= ide;
+			end
+			ide: begin
+				n_state <= reserve_bit;
+			end
+			reserve_bit: begin
+				n_state <= num_of_bytes;
+			end
+			num_of_bytes: begin
+				if(data_byte_count == 11'd3) begin
+					n_state <= data_out;
+				end
+				else begin
+					n_state <= num_of_bytes;
+				end
+			end
+			data_out: begin
+				if(data_bit_count == 11'd63) begin
+					n_state <= crc_out;
+				end
+				else begin
+					n_state <= data_out;
+				end
+			end
+			crc_out: begin
+				if(crc_count == 11'd14) begin
+					n_state <= crc_delimiter;
+				end
+				else begin
+					n_state <= crc_out;
+				end
+			end
+			crc_delimiter: begin
+				n_state <= ack;
+			end
+			ack: begin
+				n_state <= ack_delimiter;
+			end
+			ack_delimiter: begin
+				n_state <= end_of_frame;
+			end
+			end_of_frame: begin
+				if(eof_count == 11'd6) begin
+					n_state <= idle;
+				end
+				else begin
+					n_state <= end_of_frame;
+				end
+			end
+			default:
+			begin
+				n_state <= idle;
+			end
+		endcase
+	end
+
+	//Output Logic
+	always @(c_state or address or data or crc_output or crc_count or data_byte_count or data_bit_count or address_count) begin
+		case(c_state) 
+			idle: begin
+				tx <= 1;
+				can_bitstuff <= 0;
+				txing <= 1'b0;
+			end
+			addressing: begin
+				tx <= address[11'd10-address_count];
+				can_bitstuff <= 1;
+				txing <= 1'b1;
+			end
+			start_of_frame: begin
+				tx<= 0;
+				can_bitstuff <= 1'b0;
+				txing <= 1'b1;
+			end
+			rtr: begin
+				tx <= 0;
+				can_bitstuff <= 1;
+				txing <= 1'b1;
+			end
+			ide: begin
+				tx <= 0;
+				can_bitstuff <= 1;
+				txing <= 1'b1;
+			end
+			reserve_bit: begin
+				tx <= 0;
+				can_bitstuff <= 1;
+				txing <= 1'b1;
+			end
+			num_of_bytes: begin
+				tx <= bytes[11'd3-data_byte_count];
+				can_bitstuff <= 1;
+				txing <= 1'b1;
+			end
+			data_out: begin
+				tx <= data[11'd63-data_bit_count];
+				can_bitstuff <= 1;
+				txing <= 1'b1;
+			end
+			crc_out: begin
+				tx <= crc_output[11'd14-crc_count];
+				can_bitstuff <= 1;
+				txing <= 1'b1;
+			end
+			crc_delimiter: begin
+				tx <= 1;
+				can_bitstuff <= 0;
+				txing <= 1'b1;
+			end
+			ack: begin
+				tx <= 1;
+				can_bitstuff <= 0;
+				txing <= 1'b1;
+			end
+			ack_delimiter:begin
+				tx <= 1;
+				can_bitstuff <= 0;
+				txing <= 1'b1;
+			end
+			end_of_frame: begin
+				tx <= 1;
+				can_bitstuff <= 0;
+				txing <= 1'b1;
+			end
+			waiting: begin
+				tx <= 1;
+				can_bitstuff <= 0;
+				txing <= 1'b0;
+			end
+			default: begin
+				tx <= 1;
+				can_bitstuff <= 0;
+				txing <= 1'b1;
+			end
+		endcase
+	end
+
+endmodule
+module BaudGen(clk,rst,baud_clk);
+input clk,rst;
+output reg baud_clk;
+
+//EndCount is equal to clk frequency/baud frequency
+// Therefore 400MHz/500kHz = 800
+parameter EndCount = 10'd0;
+reg[9:0] count = 0;
+
+always@(posedge clk)begin
+	if(rst == 1) begin
+		count <=10'd0;
+		baud_clk <= 10'd0;
+	end
+	else if(count == EndCount) begin
+		count <= 10'd0; 
+		baud_clk <= ~baud_clk;
+		end
+	else begin
+		count <= count + 10'd1;
+		baud_clk <= baud_clk;
+		end
+	end
+
+endmodule
+
+`timescale 1ns/10ps
+
+ 
+
+module OneShot(
+    input pulse,
+    input clk,
+    input rst,
+    output reg out
+    );
+initial out = 0;
+parameter waiting_l = 2'b00, on = 2'b01, waiting_h = 2'b10;
+reg[1:0] next_state, current_state;
+
+always @ (posedge clk or posedge rst) begin
+	if(rst) begin
+		current_state <= waiting_l;
+	end
+	else begin
+		current_state <= next_state;
+	end
+end
+
+always @ (current_state or pulse) begin
+	if(current_state == on) begin
+		next_state <= waiting_h;
+	end
+	else if(current_state == waiting_h) begin
+		if(pulse) begin
+			next_state <= waiting_h;
+		end
+		else begin
+			next_state <= waiting_l;
+		end
+	end
+	else if(pulse) begin
+		next_state<= on;
+	end
+	else begin
+		next_state<= waiting_l;
+	end
+end
+
+always @(current_state or rst) begin
+	if(rst)
+		out <= 1'b0;
+	else if(current_state == on)
+		out <= 1'b1;
+	else 
+		out <= 1'b0;
+end
+
+
+
+
+
+
+
+
+endmodule
+module CRC(
+  input [63:0] data_in,
+  input crc_en,
+  output [14:0] crc_out,
+  input rst,
+  input clk);
+//
+  reg [14:0] lfsr_q ,lfsr_c ;
+//
+  assign crc_out[14:0] = lfsr_q[14:0];
+
+  always @(*) begin
+     lfsr_c[0] = lfsr_q[0] ^ lfsr_q[2] ^ lfsr_q[3] ^ lfsr_q[8] ^ lfsr_q[9] ^ lfsr_q[12] ^ lfsr_q[13] ^ lfsr_q[14] ^ data_in[0] ^ data_in[1] ^ data_in[2] ^ data_in[3] ^ data_in[4] ^ data_in[6] ^ data_in[7] ^ data_in[9] ^ data_in[10] ^ data_in[11] ^ data_in[12] ^ data_in[14] ^ data_in[17] ^ data_in[19] ^ data_in[20] ^ data_in[21] ^ data_in[27] ^ data_in[29] ^ data_in[33] ^ data_in[37] ^ data_in[38] ^ data_in[43] ^ data_in[45] ^ data_in[48] ^ data_in[49] ^ data_in[51] ^ data_in[52] ^ data_in[57] ^ data_in[58] ^ data_in[61] ^ data_in[62] ^ data_in[63];
+    lfsr_c[1] = lfsr_q[0] ^ lfsr_q[1] ^ lfsr_q[3] ^ lfsr_q[4] ^ lfsr_q[9] ^ lfsr_q[10] ^ lfsr_q[13] ^ lfsr_q[14] ^ data_in[1] ^ data_in[2] ^ data_in[3] ^ data_in[4] ^ data_in[5] ^ data_in[7] ^ data_in[8] ^ data_in[10] ^ data_in[11] ^ data_in[12] ^ data_in[13] ^ data_in[15] ^ data_in[18] ^ data_in[20] ^ data_in[21] ^ data_in[22] ^ data_in[28] ^ data_in[30] ^ data_in[34] ^ data_in[38] ^ data_in[39] ^ data_in[44] ^ data_in[46] ^ data_in[49] ^ data_in[50] ^ data_in[52] ^ data_in[53] ^ data_in[58] ^ data_in[59] ^ data_in[62] ^ data_in[63];
+    lfsr_c[2] = lfsr_q[1] ^ lfsr_q[2] ^ lfsr_q[4] ^ lfsr_q[5] ^ lfsr_q[10] ^ lfsr_q[11] ^ lfsr_q[14] ^ data_in[2] ^ data_in[3] ^ data_in[4] ^ data_in[5] ^ data_in[6] ^ data_in[8] ^ data_in[9] ^ data_in[11] ^ data_in[12] ^ data_in[13] ^ data_in[14] ^ data_in[16] ^ data_in[19] ^ data_in[21] ^ data_in[22] ^ data_in[23] ^ data_in[29] ^ data_in[31] ^ data_in[35] ^ data_in[39] ^ data_in[40] ^ data_in[45] ^ data_in[47] ^ data_in[50] ^ data_in[51] ^ data_in[53] ^ data_in[54] ^ data_in[59] ^ data_in[60] ^ data_in[63];
+    lfsr_c[3] = lfsr_q[0] ^ lfsr_q[5] ^ lfsr_q[6] ^ lfsr_q[8] ^ lfsr_q[9] ^ lfsr_q[11] ^ lfsr_q[13] ^ lfsr_q[14] ^ data_in[0] ^ data_in[1] ^ data_in[2] ^ data_in[5] ^ data_in[11] ^ data_in[13] ^ data_in[15] ^ data_in[19] ^ data_in[21] ^ data_in[22] ^ data_in[23] ^ data_in[24] ^ data_in[27] ^ data_in[29] ^ data_in[30] ^ data_in[32] ^ data_in[33] ^ data_in[36] ^ data_in[37] ^ data_in[38] ^ data_in[40] ^ data_in[41] ^ data_in[43] ^ data_in[45] ^ data_in[46] ^ data_in[49] ^ data_in[54] ^ data_in[55] ^ data_in[57] ^ data_in[58] ^ data_in[60] ^ data_in[62] ^ data_in[63];
+    lfsr_c[4] = lfsr_q[0] ^ lfsr_q[1] ^ lfsr_q[2] ^ lfsr_q[3] ^ lfsr_q[6] ^ lfsr_q[7] ^ lfsr_q[8] ^ lfsr_q[10] ^ lfsr_q[13] ^ data_in[0] ^ data_in[4] ^ data_in[7] ^ data_in[9] ^ data_in[10] ^ data_in[11] ^ data_in[16] ^ data_in[17] ^ data_in[19] ^ data_in[21] ^ data_in[22] ^ data_in[23] ^ data_in[24] ^ data_in[25] ^ data_in[27] ^ data_in[28] ^ data_in[29] ^ data_in[30] ^ data_in[31] ^ data_in[34] ^ data_in[39] ^ data_in[41] ^ data_in[42] ^ data_in[43] ^ data_in[44] ^ data_in[45] ^ data_in[46] ^ data_in[47] ^ data_in[48] ^ data_in[49] ^ data_in[50] ^ data_in[51] ^ data_in[52] ^ data_in[55] ^ data_in[56] ^ data_in[57] ^ data_in[59] ^ data_in[62];
+    lfsr_c[5] = lfsr_q[0] ^ lfsr_q[1] ^ lfsr_q[2] ^ lfsr_q[3] ^ lfsr_q[4] ^ lfsr_q[7] ^ lfsr_q[8] ^ lfsr_q[9] ^ lfsr_q[11] ^ lfsr_q[14] ^ data_in[1] ^ data_in[5] ^ data_in[8] ^ data_in[10] ^ data_in[11] ^ data_in[12] ^ data_in[17] ^ data_in[18] ^ data_in[20] ^ data_in[22] ^ data_in[23] ^ data_in[24] ^ data_in[25] ^ data_in[26] ^ data_in[28] ^ data_in[29] ^ data_in[30] ^ data_in[31] ^ data_in[32] ^ data_in[35] ^ data_in[40] ^ data_in[42] ^ data_in[43] ^ data_in[44] ^ data_in[45] ^ data_in[46] ^ data_in[47] ^ data_in[48] ^ data_in[49] ^ data_in[50] ^ data_in[51] ^ data_in[52] ^ data_in[53] ^ data_in[56] ^ data_in[57] ^ data_in[58] ^ data_in[60] ^ data_in[63];
+    lfsr_c[6] = lfsr_q[0] ^ lfsr_q[1] ^ lfsr_q[2] ^ lfsr_q[3] ^ lfsr_q[4] ^ lfsr_q[5] ^ lfsr_q[8] ^ lfsr_q[9] ^ lfsr_q[10] ^ lfsr_q[12] ^ data_in[2] ^ data_in[6] ^ data_in[9] ^ data_in[11] ^ data_in[12] ^ data_in[13] ^ data_in[18] ^ data_in[19] ^ data_in[21] ^ data_in[23] ^ data_in[24] ^ data_in[25] ^ data_in[26] ^ data_in[27] ^ data_in[29] ^ data_in[30] ^ data_in[31] ^ data_in[32] ^ data_in[33] ^ data_in[36] ^ data_in[41] ^ data_in[43] ^ data_in[44] ^ data_in[45] ^ data_in[46] ^ data_in[47] ^ data_in[48] ^ data_in[49] ^ data_in[50] ^ data_in[51] ^ data_in[52] ^ data_in[53] ^ data_in[54] ^ data_in[57] ^ data_in[58] ^ data_in[59] ^ data_in[61];
+    lfsr_c[7] = lfsr_q[1] ^ lfsr_q[4] ^ lfsr_q[5] ^ lfsr_q[6] ^ lfsr_q[8] ^ lfsr_q[10] ^ lfsr_q[11] ^ lfsr_q[12] ^ lfsr_q[14] ^ data_in[0] ^ data_in[1] ^ data_in[2] ^ data_in[4] ^ data_in[6] ^ data_in[9] ^ data_in[11] ^ data_in[13] ^ data_in[17] ^ data_in[21] ^ data_in[22] ^ data_in[24] ^ data_in[25] ^ data_in[26] ^ data_in[28] ^ data_in[29] ^ data_in[30] ^ data_in[31] ^ data_in[32] ^ data_in[34] ^ data_in[38] ^ data_in[42] ^ data_in[43] ^ data_in[44] ^ data_in[46] ^ data_in[47] ^ data_in[50] ^ data_in[53] ^ data_in[54] ^ data_in[55] ^ data_in[57] ^ data_in[59] ^ data_in[60] ^ data_in[61] ^ data_in[63];
+    lfsr_c[8] = lfsr_q[0] ^ lfsr_q[3] ^ lfsr_q[5] ^ lfsr_q[6] ^ lfsr_q[7] ^ lfsr_q[8] ^ lfsr_q[11] ^ lfsr_q[14] ^ data_in[0] ^ data_in[4] ^ data_in[5] ^ data_in[6] ^ data_in[9] ^ data_in[11] ^ data_in[17] ^ data_in[18] ^ data_in[19] ^ data_in[20] ^ data_in[21] ^ data_in[22] ^ data_in[23] ^ data_in[25] ^ data_in[26] ^ data_in[30] ^ data_in[31] ^ data_in[32] ^ data_in[35] ^ data_in[37] ^ data_in[38] ^ data_in[39] ^ data_in[44] ^ data_in[47] ^ data_in[49] ^ data_in[52] ^ data_in[54] ^ data_in[55] ^ data_in[56] ^ data_in[57] ^ data_in[60] ^ data_in[63];
+    lfsr_c[9] = lfsr_q[1] ^ lfsr_q[4] ^ lfsr_q[6] ^ lfsr_q[7] ^ lfsr_q[8] ^ lfsr_q[9] ^ lfsr_q[12] ^ data_in[1] ^ data_in[5] ^ data_in[6] ^ data_in[7] ^ data_in[10] ^ data_in[12] ^ data_in[18] ^ data_in[19] ^ data_in[20] ^ data_in[21] ^ data_in[22] ^ data_in[23] ^ data_in[24] ^ data_in[26] ^ data_in[27] ^ data_in[31] ^ data_in[32] ^ data_in[33] ^ data_in[36] ^ data_in[38] ^ data_in[39] ^ data_in[40] ^ data_in[45] ^ data_in[48] ^ data_in[50] ^ data_in[53] ^ data_in[55] ^ data_in[56] ^ data_in[57] ^ data_in[58] ^ data_in[61];
+    lfsr_c[10] = lfsr_q[3] ^ lfsr_q[5] ^ lfsr_q[7] ^ lfsr_q[10] ^ lfsr_q[12] ^ lfsr_q[14] ^ data_in[0] ^ data_in[1] ^ data_in[3] ^ data_in[4] ^ data_in[8] ^ data_in[9] ^ data_in[10] ^ data_in[12] ^ data_in[13] ^ data_in[14] ^ data_in[17] ^ data_in[22] ^ data_in[23] ^ data_in[24] ^ data_in[25] ^ data_in[28] ^ data_in[29] ^ data_in[32] ^ data_in[34] ^ data_in[38] ^ data_in[39] ^ data_in[40] ^ data_in[41] ^ data_in[43] ^ data_in[45] ^ data_in[46] ^ data_in[48] ^ data_in[52] ^ data_in[54] ^ data_in[56] ^ data_in[59] ^ data_in[61] ^ data_in[63];
+    lfsr_c[11] = lfsr_q[0] ^ lfsr_q[4] ^ lfsr_q[6] ^ lfsr_q[8] ^ lfsr_q[11] ^ lfsr_q[13] ^ data_in[1] ^ data_in[2] ^ data_in[4] ^ data_in[5] ^ data_in[9] ^ data_in[10] ^ data_in[11] ^ data_in[13] ^ data_in[14] ^ data_in[15] ^ data_in[18] ^ data_in[23] ^ data_in[24] ^ data_in[25] ^ data_in[26] ^ data_in[29] ^ data_in[30] ^ data_in[33] ^ data_in[35] ^ data_in[39] ^ data_in[40] ^ data_in[41] ^ data_in[42] ^ data_in[44] ^ data_in[46] ^ data_in[47] ^ data_in[49] ^ data_in[53] ^ data_in[55] ^ data_in[57] ^ data_in[60] ^ data_in[62];
+    lfsr_c[12] = lfsr_q[1] ^ lfsr_q[5] ^ lfsr_q[7] ^ lfsr_q[9] ^ lfsr_q[12] ^ lfsr_q[14] ^ data_in[2] ^ data_in[3] ^ data_in[5] ^ data_in[6] ^ data_in[10] ^ data_in[11] ^ data_in[12] ^ data_in[14] ^ data_in[15] ^ data_in[16] ^ data_in[19] ^ data_in[24] ^ data_in[25] ^ data_in[26] ^ data_in[27] ^ data_in[30] ^ data_in[31] ^ data_in[34] ^ data_in[36] ^ data_in[40] ^ data_in[41] ^ data_in[42] ^ data_in[43] ^ data_in[45] ^ data_in[47] ^ data_in[48] ^ data_in[50] ^ data_in[54] ^ data_in[56] ^ data_in[58] ^ data_in[61] ^ data_in[63];
+    lfsr_c[13] = lfsr_q[0] ^ lfsr_q[2] ^ lfsr_q[6] ^ lfsr_q[8] ^ lfsr_q[10] ^ lfsr_q[13] ^ data_in[3] ^ data_in[4] ^ data_in[6] ^ data_in[7] ^ data_in[11] ^ data_in[12] ^ data_in[13] ^ data_in[15] ^ data_in[16] ^ data_in[17] ^ data_in[20] ^ data_in[25] ^ data_in[26] ^ data_in[27] ^ data_in[28] ^ data_in[31] ^ data_in[32] ^ data_in[35] ^ data_in[37] ^ data_in[41] ^ data_in[42] ^ data_in[43] ^ data_in[44] ^ data_in[46] ^ data_in[48] ^ data_in[49] ^ data_in[51] ^ data_in[55] ^ data_in[57] ^ data_in[59] ^ data_in[62];
+    lfsr_c[14] = lfsr_q[1] ^ lfsr_q[2] ^ lfsr_q[7] ^ lfsr_q[8] ^ lfsr_q[11] ^ lfsr_q[12] ^ lfsr_q[13] ^ data_in[0] ^ data_in[1] ^ data_in[2] ^ data_in[3] ^ data_in[5] ^ data_in[6] ^ data_in[8] ^ data_in[9] ^ data_in[10] ^ data_in[11] ^ data_in[13] ^ data_in[16] ^ data_in[18] ^ data_in[19] ^ data_in[20] ^ data_in[26] ^ data_in[28] ^ data_in[32] ^ data_in[36] ^ data_in[37] ^ data_in[42] ^ data_in[44] ^ data_in[47] ^ data_in[48] ^ data_in[50] ^ data_in[51] ^ data_in[56] ^ data_in[57] ^ data_in[60] ^ data_in[61] ^ data_in[62];
+  end // always
+
+  always @(posedge clk or posedge rst) begin
+    if(rst) begin
+      lfsr_q <= {15{1'b1}};
+    end
+    else begin
+       lfsr_q[14:0] <= crc_en ? lfsr_c[14:0] : lfsr_q[14:0];
+    end
+  end // always
+endmodule // crc
+
+//////////////////////////////////////////////////////////
+///////////RX_CAN/////////////////////////
+module rx_container(
+	output reg [63:0] rx_data,
+	output reg rxing,
+	input txing,
+	input rx,
+	input clk,
+	input baud_clk,
+	input rst
+    );
+  wire rx_buf;
+	assign rx_buf = rx;
+	initial rxing = 1'b0;
+	initial rx_data = 64'd0;
+  reg[63:0] data_buf;
+reg [10:0] address;
+reg[3:0] dlc;
+  reg[149:0] shifted_bus;
+  reg finished_rx;
+	reg[63:0] shift_buffer = 64'd0;
+	reg[7:0] c_state=0, n_state=0;
+  wire pulse;
+  assign pulse = (c_state==8'h8);
+
+parameter idle = 8'h0,  start_of_frame = 8'h1, addressing =8'h2 ,rtr = 8'h3 ,ide = 8'h4, reserve_bit = 8'h5, num_of_bytes = 8'h6,
+			data_in = 8'h7, crc_in = 8'h8, crc_delimiter = 8'h9 , ack = 8'hA, ack_delimiter =  8'hB, end_of_frame = 8'hC, waiting = 8'hD;
+parameter bytes = 5'd8;
+	reg[10:0] address_count = 0, crc_count = 0, eof_count = 0 , data_bit_count = 0, data_byte_count = 0;
+	
+	shift_reg data_frame_buffer(rx, shifted_bus, finished_rx, rst, baud_clk);
+	
+	//always @ (posedge clk or rst) begin
+		//end
+	
+  reg[14:0] crc_output, crc_holder=15'h0;
+	wire one_shotted_send;
+  wire[14:0] crc_buff;
+ // assign one_shotted_send=(crc_count==15'b0 && c_state== crc_in)?1'b1:1'b0;
+  CRC cyclic_red_check(data_buf,one_shotted_send , crc_buff,rst,clk);
+  OneShot os(pulse, clk, rst, one_shotted_send);
+always@(posedge baud_clk or posedge rst) begin
+if(rst == 1) begin
+			c_state <= 32'd0;
+		end
+		else begin
+			c_state <= n_state;
+		end
+	end
+		always @ (posedge baud_clk) begin
+		case(c_state) 
+			idle: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			waiting: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			start_of_frame:begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			addressing: begin
+				address[address_count] <=rx;
+				address_count <= address_count + 1'b1;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			rtr: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			ide: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			reserve_bit: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			num_of_bytes: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				dlc[data_byte_count] <= rx;
+				data_byte_count<= data_byte_count +1'b1;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			data_in: begin
+				address_count <= 11'd0;
+				data_buf[data_bit_count] <= rx;
+				data_bit_count<= data_bit_count +1'b1;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			crc_in: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+              crc_holder[crc_count] <= rx; 
+				crc_count <= crc_count + 1'b1; 
+				eof_count <= 11'd0;
+			end
+			crc_delimiter: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+              crc_holder <= 15'h0; 
+              crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			ack: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			ack_delimiter:begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+			end_of_frame: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= eof_count +1'b1;
+			end
+			default: begin
+				address_count <= 11'd0;
+				data_bit_count<= 11'd0;
+				data_byte_count<= 11'd0;
+				crc_count <= 11'd0; 
+				eof_count <= 11'd0;
+			end
+		endcase
+	end
+  always @ (c_state or rx_buf or data_buf  or address_count  or data_byte_count
+		or data_bit_count or crc_count or eof_count  or crc_output) begin
+		case(c_state)
+		idle: begin
+          if(txing ==1'b0 ) begin
+			n_state <= start_of_frame;
+			end else
+			n_state <= idle;
+		      end
+		start_of_frame : begin
+          if(!rx_buf && txing==1'b0) begin
+			n_state <= addressing;
+			end else begin
+			n_state <= waiting;
+			end
+			end
+		waiting : begin
+			if(txing == 1'b0) begin
+			n_state <= start_of_frame;
+            end else if(txing==1'b1)begin
+              n_state <= idle;
+            end else begin
+			n_state <= waiting;
+			end
+			end
+		addressing : begin
+          if(rx_buf != rx) begin
+					n_state <= waiting; //Lost Arbitration
+				end
+				else if(address_count == 11'd10) begin
+					n_state <= rtr;
+				end
+				else begin
+					n_state <= addressing;
+				end
+			end
+			rtr: begin
+				n_state <= ide;
+			end
+			ide: begin
+				n_state <= reserve_bit;
+			end
+			reserve_bit: begin
+				n_state <= num_of_bytes;
+			end
+			num_of_bytes: begin
+				if(data_byte_count == 11'd3) begin
+					n_state <= data_in;
+				end
+				else begin
+					n_state <= num_of_bytes;
+				end
+			end
+			data_in: begin
+				if(data_bit_count == 11'd63) begin
+					n_state <= crc_in;
+				end
+				else begin
+					n_state <= data_in;
+				end
+			end
+			crc_in: begin
+              if(crc_count == 11'd15) begin
+					if(crc_holder == crc_buff)
+					n_state <= crc_delimiter;
+				end
+				else begin
+					n_state <= crc_in;
+				end
+			end
+			crc_delimiter: begin
+				n_state <= ack;
+			end
+			ack: begin
+				n_state <= ack_delimiter;
+			end
+			ack_delimiter: begin
+				n_state <= end_of_frame;
+
+			end
+			end_of_frame: begin
+              if(eof_count == 11'd6 && finished_rx) begin
+					n_state <= idle;
+				end
+				else begin
+					n_state <= end_of_frame;
+				end
+			end
+			default:
+			begin
+				n_state <= idle;
+			end
+		endcase
+	end
+  always @(c_state or address or data_buf or crc_output or crc_count or data_byte_count or data_bit_count or address_count) begin
+		case(c_state) 
+			idle : begin
+				rxing <= 1'b0;
+				rx_data <= 64'b0;
+				end
+			start_of_frame : begin
+				rxing <= 1'b1;
+				rx_data <= 64'b0;
+				end
+			waiting : begin
+				rxing <= 1'b0;
+				rx_data <= 64'b0;
+				end
+			addressing : begin
+				rxing <= 1'b1;
+				rx_data <= 64'b0;
+				end
+			rtr : begin
+				rxing <= 1'b1;
+				rx_data <= 64'b0;
+				end
+			ide :begin
+				rxing <= 1'b1;
+				rx_data <= 64'b0;
+				end
+			reserve_bit : begin
+				rxing <= 1'b1;
+				rx_data <= 64'b0;
+				end
+			num_of_bytes : begin
+			
+				rxing <= 1'b1;
+				rx_data <= 64'b0;
+				end
+			data_in : begin
+				rxing <= 1'b1;
+				rx_data <= data_buf;
+				end
+			 crc_in : begin
+				rxing <= 1'b1;
+				rx_data <= rx_data;
+				end
+			crc_delimiter: begin
+				rxing <= 1'b1;
+				rx_data <= rx_data;
+				end
+			ack : begin
+				rxing <= 1'b1;
+				rx_data <= rx_data;
+				end
+			ack_delimiter : begin
+				rxing <= 1'b1;
+				rx_data <= rx_data;
+				end
+			end_of_frame :begin
+				rxing <= 1'b1;
+				rx_data <= rx_data;
+				end
+			default :begin
+				rxing <= 1'b0;
+				rx_data <= rx_data;
+				end
+		endcase
+	end
+
+
+
+
+
+endmodule
+
+
+module shift_reg(
+    input rx,
+  output reg[149:0] shifted_bus,
+	output reg finished_rx,
+    input rst,
+    input baud_clk
+    );
+	
+	parameter reg_length = 150;
+
+	initial finished_rx = 0;
+	parameter idle = 2'b00, reading = 2'b01, finished = 2'b10, finished_and_waiting = 2'b11;
+	reg[1:0] current_state, next_state;
+	
+	reg [(reg_length-1):0] bitShiftReg = {reg_length{1'b1}};
+
+	always @(posedge baud_clk or posedge rst) begin
+		if(rst) begin
+			bitShiftReg <= {reg_length{1'b1}};
+			current_state <=  idle;
+		end
+		else begin
+			current_state <= next_state;
+			bitShiftReg <= {bitShiftReg[(reg_length-2):0],rx};
+		end
+	end
+	always @(rx or bitShiftReg or current_state) begin
+		case(current_state) 
+			idle: begin
+				if(rx == 1)
+					next_state <= idle;
+				else 
+					next_state <= reading;
+				end
+			reading: begin
+				if(bitShiftReg[6:0] == {7{1'b1}})
+					next_state <= finished;
+				else
+					next_state <= reading;
+				end
+			finished: begin
+              finished_rx <=1'b1;
+				next_state<= finished_and_waiting;
+			end
+			
+			default: begin
+				next_state<=idle;
+			end
+		endcase
+	end
+	
+	/*always @ (current_state) begin
+		if(current_state == finished)
+			finished_rx <= 1;
+		else
+			finished_rx <= 0;
+	end*/
+	
+	always @ (posedge finished_rx or posedge rst) begin
+		if(rst) 
+			shifted_bus <= {reg_length{1'b1}};
+		else
+			shifted_bus <= bitShiftReg;
+	end
+ 
+endmodule
